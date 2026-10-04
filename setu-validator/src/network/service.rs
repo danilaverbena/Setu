@@ -2294,13 +2294,29 @@ mod tests {
     }
 
     fn sample_solver_request(solver_id: &str) -> setu_rpc::RegisterSolverRequest {
+        use k256::ecdsa::SigningKey;
+        let sk = SigningKey::from_slice(&[43u8; 32]).expect("fixed test key");
+        let pk = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let mut reg = setu_types::SolverRegistration::new(
+            solver_id.to_string(),
+            "127.0.0.1".to_string(),
+            9001,
+            "0xtest".to_string(),
+            pk,
+            vec![],
+        );
+        reg.sign(&[43u8; 32]).expect("sign test request");
         setu_rpc::RegisterSolverRequest {
             solver_id: solver_id.to_string(),
             address: "127.0.0.1".to_string(),
             port: 9001,
             account_address: "0xtest".to_string(),
-            public_key: vec![],
-            signature: vec![],
+            public_key: reg.public_key,
+            signature: reg.signature,
             capacity: 100,
             shard_id: Some("shard-0".to_string()),
             assigned_shard: None,
@@ -2529,6 +2545,36 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(service.validator_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_solver_rejects_missing_signature() {
+        // Phantom-solver admission: no ownership proof at all.
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        let mut request = sample_solver_request("solver-evil");
+        request.signature.clear();
+
+        let response = handler.register_solver(request).await;
+
+        assert!(!response.success);
+        assert!(response.message.contains("signature"));
+        assert_eq!(service.router_manager().solver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn register_solver_rejects_tampered_address() {
+        // Valid signature, then swap a bound field: must invalidate.
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        let mut request = sample_solver_request("solver-evil");
+        request.address = "9.9.9.9".to_string();
+
+        let response = handler.register_solver(request).await;
+
+        assert!(!response.success);
+        assert!(response.message.contains("signature"));
+        assert_eq!(service.router_manager().solver_count(), 0);
     }
 
     #[tokio::test]

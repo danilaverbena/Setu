@@ -71,6 +71,32 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             warn!(solver_id = %request.solver_id, "Solver already registered, will update");
         }
 
+        // Auth: solver must prove ownership of the claimed public key.
+        // Previously nothing was verified: anyone could register phantom
+        // solvers, and with no staleness eviction those entries persist,
+        // blackholing routed tasks indefinitely.
+        {
+            let auth_check = SolverRegistration::new(
+                request.solver_id.clone(),
+                request.address.clone(),
+                request.port,
+                request.account_address.clone(),
+                request.public_key.clone(),
+                request.signature.clone(),
+            );
+            if !auth_check.verify_signature() {
+                warn!(
+                    solver_id = %request.solver_id,
+                    "Rejecting solver registration: invalid ownership signature"
+                );
+                return RegisterSolverResponse {
+                    success: false,
+                    message: "Invalid registration signature: must prove ownership of the claimed public key".to_string(),
+                    assigned_id: None,
+                };
+            }
+        }
+
         // Create registration event
         let vlc_time = self.service.get_vlc_time();
         let mut vlc = setu_vlc::VectorClock::new();
