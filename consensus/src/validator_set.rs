@@ -86,29 +86,32 @@ impl ValidatorSet {
     /// Rejects unauthenticated validator membership changes (#45).
     /// The validator's signature over its node ID must be verified
     /// before adding to prevent unauthorized membership changes.
-    /// If verification fails, the validator is NOT added and a warning is logged.
-    pub fn add_validator(&mut self, mut info: ValidatorInfo) {
+    /// Returns `true` if the validator was added, `false` if verification
+    /// failed (a warning is logged). Callers MUST check the return value:
+    /// a rejected insert must not be reported as success.
+    pub fn add_validator(&mut self, mut info: ValidatorInfo) -> bool {
         // Verify the validator's signature (audit #45 / unauthenticated membership)
         if let Err(e) = info.verify() {
             warn!(
                 validator_id = %info.node.id,
                 "Rejecting unauthenticated validator membership change: {}", e
             );
-            return;
+            return false;
         }
-        
+
         let is_first = self.validators.is_empty();
-        
+
         // First validator becomes the initial leader
         if is_first {
             info.is_leader = true;
             self.leader_id = Some(info.node.id.clone());
         }
-        
+
         self.validators.insert(info.node.id.clone(), info);
-        
+
         // Rebuild election when validators change
         self.rebuild_election();
+        true
     }
 
     /// Remove a validator from the set.

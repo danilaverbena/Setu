@@ -1715,6 +1715,49 @@ impl MockEnclave {
         *hasher.finalize().as_bytes()
     }
 
+    /// Flatten an isolated-path `InMemoryObjectStore` into root preimage entries.
+    ///
+    /// Covers ALL three maps: `raw` (module/linkage bytes), `envelopes`
+    /// (Move objects), and `raw_objects` (type-agnostic bytes). Hashing only
+    /// `raw()` left coin/object writes out of the attested root, so distinct
+    /// post-execution states attested the same root.
+    fn object_store_root_data(
+        store: &InMemoryObjectStore,
+    ) -> Result<HashMap<String, Vec<u8>>, StfError> {
+        let mut data: HashMap<String, Vec<u8>> = HashMap::new();
+        for (k, v) in store.raw().iter() {
+            data.insert(format!("raw:{k}"), v.clone());
+        }
+        for (id, env) in store.envelopes().iter() {
+            let bytes = bcs::to_bytes(env).map_err(|e| {
+                StfError::StateRootComputationFailed(format!("envelope BCS failed: {e}"))
+            })?;
+            data.insert(format!("env:{id:?}"), bytes);
+        }
+        for (id, bytes) in store.raw_objects().iter() {
+            data.insert(format!("robj:{id:?}"), bytes.clone());
+        }
+        Ok(data)
+    }
+
+    /// Flatten a legacy-path `InMemoryStateStore` into root preimage entries.
+    ///
+    /// Covers BOTH `raw_objects` and `objects` (coins). Coins live in
+    /// `objects`, so a root over raw bytes alone never changed on
+    /// transfer/merge/split.
+    fn state_store_root_data(
+        store: &InMemoryStateStore,
+    ) -> Result<HashMap<String, Vec<u8>>, StfError> {
+        let mut data: HashMap<String, Vec<u8>> = HashMap::new();
+        for (id, bytes) in store.raw_objects().iter() {
+            data.insert(format!("robj:{id:?}"), bytes.clone());
+        }
+        for (id, coin) in store.objects().iter() {
+            data.insert(format!("obj:{id:?}"), coin.to_coin_state_bytes());
+        }
+        Ok(data)
+    }
+
     /// Compute hash of output for attestation user_data
     ///
     /// Reserved for future use: binding attestation to output commitment
@@ -1781,26 +1824,25 @@ impl EnclaveRuntime for MockEnclave {
             let (diff, events_processed, events_failed, runtime) =
                 self.simulate_execution_isolated(&input, local_runtime)
                     .await?;
-            let raw_data: std::collections::HashMap<String, Vec<u8>> =
-                runtime.state().raw().clone();
+            let raw_data = Self::object_store_root_data(runtime.state())?;
             let post_state_root = Self::compute_state_root(&raw_data);
             (diff, events_processed, events_failed, post_state_root)
         } else {
-            // Legacy mode: use shared self.runtime (only for backward compatibility)
-            self.simulate_execution(&input, None).await?;
-            // self.runtime contains the post-execution state
-            let guard = self.runtime.read().await;
-            let state = guard.state().clone();
-            drop(guard);
-            let runtime = RuntimeExecutor::new(state);
-            let raw_data: std::collections::HashMap<String, Vec<u8>> = runtime
-                .state()
-                .raw_objects()
-                .iter()
-                .map(|(id, bytes)| (format!("{:?}", id), bytes.clone()))
-                .collect();
-            let post_state_root = Self::compute_state_root(&raw_data);
-            (StateDiff::new(), Vec::new(), Vec::new(), post_state_root)
+            // Legacy mode: use shared self.runtime (only for backward compatibility).
+            // Keep the execution results: diff drives gas_used/stats below and
+            // the state_diff surfaced in StfOutput; dropping them (as an
+            // earlier revision did) reports empty writes/events for every
+            // legacy execution.
+            let (diff, events_processed, events_failed) =
+                self.simulate_execution(&input, None).await?;
+            // self.runtime contains the post-execution state. Read it under
+            // the existing guard directly (no clone + RuntimeExecutor rebuild).
+            let post_state_root = {
+                let guard = self.runtime.read().await;
+                let raw_data = Self::state_store_root_data(guard.state())?;
+                Self::compute_state_root(&raw_data)
+            };
+            (diff, events_processed, events_failed, post_state_root)
         };
 
         // Compute input hash for attestation binding

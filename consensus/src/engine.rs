@@ -594,21 +594,30 @@ impl ConsensusEngine {
     /// Add a validator to the consensus set, updating both ValidatorSet and
     /// ConsensusManager.validator_count atomically.
     pub async fn add_consensus_validator(&self, info: setu_types::ValidatorInfo) {
-        let count = {
+        let (added, count) = {
             let mut vs = self.validator_set.write().await;
-            vs.add_validator(info.clone());
-            // add_validator may reject unauthenticated membership changes (#45)
-            vs.count()
+            // add_validator may reject unauthenticated membership changes (#45):
+            // only advance the count and report success when it was accepted.
+            let added = vs.add_validator(info.clone());
+            (added, vs.count())
         };
         {
             let mut cm = self.consensus_manager.write().await;
             cm.update_validator_count(count);
         }
-        info!(
-            validator_id = %info.node.id,
-            total_count = count,
-            "Validator added to consensus"
-        );
+        if added {
+            info!(
+                validator_id = %info.node.id,
+                total_count = count,
+                "Validator added to consensus"
+            );
+        } else {
+            warn!(
+                validator_id = %info.node.id,
+                total_count = count,
+                "Validator NOT added to consensus (rejected)"
+            );
+        }
     }
 
     /// Get a reference to the ValidatorSet (for external queries).

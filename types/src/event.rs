@@ -563,6 +563,15 @@ impl Event {
 
     /// Canonical id of the chain's genesis event.
     ///
+    /// Deploy/upgrade note (V1 → V2 coordinated upgrade): V2 IDs
+    /// (`SETU_EVENT_ID_V2`, full content binding) are NOT wire-compatible
+    /// with V1 IDs — `verify_id()` accepts V2 only, so V1-issued events,
+    /// V1 genesis IDs, and V1 peers are rejected after this change rolls
+    /// out. This is intentional for a pre-mainnet testnet (no V1 history
+    /// to preserve): all validators must upgrade together; mixed-version
+    /// networks will fork at admission. Do NOT add V1 fallback acceptance
+    /// without a replay analysis (a V1 ID binds almost nothing and would
+    /// re-open payload substitution).
     /// The validator builds the genesis event deterministically
     /// (`setu-validator/src/main.rs`): empty `parent_ids`, fixed creator
     /// `"genesis"`, `timestamp = 0`, and `logical_time = 0`. `compute_id`
@@ -820,13 +829,19 @@ impl Event {
         }
         hasher.update(Self::canonical_json(payload).as_bytes());
         hasher.update(Self::canonical_json(transfer).as_bytes());
-        hasher.update(
-            subnet_id
-                .as_ref()
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-                .as_bytes(),
-        );
+        // Bind the FULL 32-byte subnet ID with an explicit presence tag.
+        // `SubnetId::Display` emits only the first 8 bytes: distinct subnets
+        // sharing a displayed prefix would otherwise contribute identical
+        // bytes and verify_id would not bind the event to its subnet.
+        match subnet_id.as_ref() {
+            Some(s) => {
+                hasher.update(&[1u8]);
+                hasher.update(s.as_bytes());
+            }
+            None => {
+                hasher.update(&[0u8]);
+            }
+        }
         hasher.update(&vlc_snapshot.logical_time.to_le_bytes());
         hasher.update(&vlc_snapshot.physical_time.to_le_bytes());
         for (node_id, time) in vlc_snapshot.vector_clock.sorted_entries() {
@@ -1155,7 +1170,7 @@ mod tests {
     #[test]
     fn test_genesis_event_id_is_canonical_constant() {
         const EXPECTED: &str =
-            "b35e5bf5e25c8997fa368a6ff43e9d24f3f0928131bfac5b9acb28186317e695";
+            "77dd9101b09d9c5f89c2b55fe17a77a40ea85ef76151d337d7ba8e8c19ca649b";
         assert_eq!(Event::genesis_event_id(), EXPECTED);
 
         // Mirror setu-validator/src/main.rs genesis construction.
