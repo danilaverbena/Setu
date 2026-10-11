@@ -1170,18 +1170,31 @@ impl ConsensusEngine {
         }
 
         if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
-            let local_chain_root = {
+            let (local_chain_root, has_local_history) = {
                 let manager = self.consensus_manager.read().await;
-                manager.anchor_builder().anchor_chain_root()
+                let builder = manager.anchor_builder();
+                (
+                    builder.anchor_chain_root(),
+                    builder.last_anchor().is_some(),
+                )
             };
 
-            if merkle_roots.anchor_chain_root != local_chain_root {
+            // Bootstrap exception: a node with NO local anchor history yet
+            // (fresh joiner / wiped store) has chain root zero by construction
+            // and can never match a real chain. The quorum-verified votes
+            // checked above are the trust root for this FIRST CF; chain
+            // continuity takes over from the second CF on. Without this,
+            // late joiners reject the first pulled CF and can never sync
+            // (startup catch-up aborts, HTTP stays down).
+            if has_local_history
+                && merkle_roots.anchor_chain_root != local_chain_root
+            {
                 return Err(setu_types::SetuError::InvalidData(
                     format!(
                         "Finalized CF anchor chain root mismatch - possible fork or time-travel attack: expected {}, got {}",
                         hex::encode(local_chain_root),
                         hex::encode(merkle_roots.anchor_chain_root)
-                    )
+                    ),
                 ));
             }
         }
@@ -2549,6 +2562,116 @@ mod tests {
             !pending.votes.contains_key("evil-1") && !pending.votes.contains_key("evil-2"),
             "forged votes must not be stored in pending state"
         );
+    }
+
+    /// Bootstrap exception regression: a node with NO local anchor history
+    /// (fresh joiner, wiped store) must accept its FIRST finalized CF on the
+    /// strength of quorum-verified votes alone. Strictly requiring chain
+    /// continuity from a zero root would reject every real chain and make
+    /// late-joining impossible (startup catch-up aborts, HTTP stays down).
+    /// Continuity enforcement resumes from the second CF on.
+    #[tokio::test]
+    async fn test_receive_finalized_cf_bootstrap_accepts_first_cf() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        // Fresh engine: no anchors, chain root all zeros.
+        let engine = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+
+        // A real chain's CF: anchor WITH merkle roots whose stored
+        // before-root is nonzero (i.e. NOT the local zero root).
+        // Empty-event execution yields the empty-state root: keep events_root and
+        // global_state_root zero so follower re-execution matches. The chain
+        // root is nonzero on purpose (real chain, not local zero).
+        let roots = AnchorMerkleRoots::with_roots([0u8; 32], [0u8; 32], [7u8; 32]);
+        let anchor = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 1,
+                physical_time: 0,
+            },
+            roots,
+            None,
+            1,
+        );
+        let proposer = engine.get_valid_proposer(0).await.expect("proposer");
+        let mut cf = ConsensusFrame::new(0, anchor, proposer);
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        // The bootstrap exception bypasses the chain-root check (which a
+        // history-less node can never satisfy); any LATER failure (e.g. an
+        // apply mismatch on these synthetic roots) must NOT be a chain
+        // continuity rejection.
+        let result = engine.receive_finalized_cf(cf).await;
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "first CF on a history-less node must pass the chain check (bootstrap): {e}"
+            ),
+        }
+    }
+
+    /// Continuity is still enforced AFTER bootstrap: a forked CF whose
+    /// before-root matches neither zero-history nor the local tip is rejected.
+    #[tokio::test]
+    async fn test_receive_finalized_cf_still_rejects_fork_after_bootstrap() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+
+        // First: establish local history with a legacy (rootless) CF,
+        // which finalizes without follower root verification.
+        let anchor0 = Anchor::new(vec![], VLCSnapshot::default(), "state-root".to_string(), None, 0);
+        let proposer = engine.get_valid_proposer(0).await.expect("proposer");
+        let mut cf0 = ConsensusFrame::new(0, anchor0, proposer);
+        cf0.add_vote(Vote::new("v1".to_string(), cf0.id.clone(), true));
+        cf0.add_vote(Vote::new("v2".to_string(), cf0.id.clone(), true));
+        cf0.add_vote(Vote::new("v3".to_string(), cf0.id.clone(), true));
+        cf0.finalize();
+        let (finalized, _) = engine.receive_finalized_cf(cf0).await.unwrap();
+        assert!(finalized);
+
+        // Now a forked CF with an unrelated before-root must be rejected.
+        let roots_fork = AnchorMerkleRoots::with_roots([0u8; 32], [0u8; 32], [77u8; 32]);
+        let anchor_fork = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 2,
+                physical_time: 0,
+            },
+            roots_fork,
+            Some("whatever".to_string()),
+            1,
+        );
+        let proposer = engine.get_valid_proposer(0).await.expect("proposer");
+        let mut cf_fork = ConsensusFrame::new(0, anchor_fork, proposer);
+        cf_fork.add_vote(Vote::new("v1".to_string(), cf_fork.id.clone(), true));
+        cf_fork.add_vote(Vote::new("v2".to_string(), cf_fork.id.clone(), true));
+        cf_fork.add_vote(Vote::new("v3".to_string(), cf_fork.id.clone(), true));
+        cf_fork.finalize();
+
+        let result = engine.receive_finalized_cf(cf_fork).await;
+        match result {
+            Err(e) => assert!(
+                format!("{e}").contains("chain root mismatch"),
+                "fork must be rejected by chain continuity, got: {e}"
+            ),
+            Ok(_) => panic!("forked CF after bootstrap must be rejected by chain continuity"),
+        }
     }
 
     #[tokio::test]
