@@ -375,7 +375,11 @@ async fn main() -> anyhow::Result<()> {
                     peer_node_info.public_key = pk_bytes;
                 }
             }
-            consensus_validator.add_peer_validator(peer_node_info).await;
+            // Genesis peers are statically trusted operator config (no
+            // registration signature exists for them).
+            consensus_validator
+                .add_trusted_peer_validator(peer_node_info)
+                .await;
         }
         let engine = consensus_validator.engine();
         let vs = engine.validator_set_ref().read().await;

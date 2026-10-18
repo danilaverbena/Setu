@@ -112,16 +112,16 @@ impl ValidatorInfo {
     }
     
     /// Verify the validator's signature over the node ID.
-    /// Returns Ok(()) if the signature is valid or if no signature
-    /// is present (for backward compatibility with existing code).
-    /// When a signature IS present, it MUST be valid — invalid
-    /// signatures are rejected.
+    ///
+    /// Fails closed: an EMPTY signature is rejected. Treating it as
+    /// "trusted" let an unsigned peer enter the consensus membership set
+    /// via `add_peer_validator` (audit #45 follow-up). Genesis / local
+    /// configuration records must use the explicit trusted admission path
+    /// (`ValidatorSet::add_trusted_validator`) instead of forging a pass
+    /// through this check.
     pub fn verify(&self) -> Result<(), &'static str> {
         if self.signature.is_empty() {
-            // No signature present — skip verification for backward
-            // compatibility. Callers should add signatures for full
-            // security (audit #45).
-            return Ok(());
+            return Err("missing validator signature");
         }
         if self.node.public_key.len() != 32 {
             return Err("invalid public key length");
@@ -214,5 +214,15 @@ mod tests {
         
         solver.current_load = 30;
         assert_eq!(solver.available_capacity(), 20);
+    }
+
+    /// Fail-closed membership admission: an unsigned record must NOT pass
+    /// verification (it previously returned Ok and let unsigned peers into
+    /// the consensus set via add_peer_validator).
+    #[test]
+    fn test_validator_info_rejects_empty_signature() {
+        let node = NodeInfo::new_validator("v1".to_string(), "127.0.0.1".to_string(), 8000);
+        let info = ValidatorInfo::new(node, false);
+        assert_eq!(info.verify(), Err("missing validator signature"));
     }
 }

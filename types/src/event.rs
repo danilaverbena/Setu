@@ -821,14 +821,19 @@ impl Event {
     ) -> EventId {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"SETU_EVENT_ID_V2:");
-        hasher.update(event_type.name().as_bytes());
+        // Every variable-length field is length-prefixed: plain
+        // concatenation lets distinct contents share a preimage without a
+        // hash collision (e.g. VLC entry ("a", b"bbbbbbbb") + creator "c"
+        // vs. empty VLC + creator "abbbbbbbbc").
+        Self::feed_bytes(&mut hasher, event_type.name().as_bytes());
         let mut sorted_parents: Vec<&EventId> = parent_ids.iter().collect();
         sorted_parents.sort();
+        hasher.update(&(sorted_parents.len() as u64).to_le_bytes());
         for parent_id in sorted_parents {
-            hasher.update(parent_id.as_bytes());
+            Self::feed_bytes(&mut hasher, parent_id.as_bytes());
         }
-        hasher.update(Self::canonical_json(payload).as_bytes());
-        hasher.update(Self::canonical_json(transfer).as_bytes());
+        Self::feed_bytes(&mut hasher, Self::canonical_json(payload).as_bytes());
+        Self::feed_bytes(&mut hasher, Self::canonical_json(transfer).as_bytes());
         // Bind the FULL 32-byte subnet ID with an explicit presence tag.
         // `SubnetId::Display` emits only the first 8 bytes: distinct subnets
         // sharing a displayed prefix would otherwise contribute identical
@@ -836,7 +841,7 @@ impl Event {
         match subnet_id.as_ref() {
             Some(s) => {
                 hasher.update(&[1u8]);
-                hasher.update(s.as_bytes());
+                Self::feed_bytes(&mut hasher, s.as_bytes());
             }
             None => {
                 hasher.update(&[0u8]);
@@ -844,13 +849,24 @@ impl Event {
         }
         hasher.update(&vlc_snapshot.logical_time.to_le_bytes());
         hasher.update(&vlc_snapshot.physical_time.to_le_bytes());
-        for (node_id, time) in vlc_snapshot.vector_clock.sorted_entries() {
-            hasher.update(node_id.as_bytes());
+        let vlc_entries = vlc_snapshot.vector_clock.sorted_entries();
+        hasher.update(&(vlc_entries.len() as u64).to_le_bytes());
+        for (node_id, time) in vlc_entries {
+            Self::feed_bytes(&mut hasher, node_id.as_bytes());
             hasher.update(&time.to_le_bytes());
         }
-        hasher.update(creator.as_bytes());
+        Self::feed_bytes(&mut hasher, creator.as_bytes());
         hasher.update(&timestamp.to_le_bytes());
         hex::encode(hasher.finalize().as_bytes())
+    }
+
+    /// Feed a length-prefixed byte string into a hasher.
+    ///
+    /// Unambiguous field framing: without the prefix, `("ab", "c")` and
+    /// `("a", "bc")` produce the same byte stream.
+    fn feed_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     }
 
     /// Canonical JSON encoding with recursively sorted object keys.
@@ -1163,14 +1179,14 @@ mod tests {
     /// construction in main.rs ever changes, this test fails loudly so
     /// the task-preparer filter does not silently stop matching.
     /// NOTE: the literal below is the V2 content-bound ID (event type,
-    /// payload, transfer, subnet, full VLC are all hashed); the pre-V2
-    /// literal was `691c8dd6...0dd6d` which bound only
-    /// (parents, logical_time, creator, timestamp) and let payload
-    /// substitution pass `verify_id()`.
+    /// payload, transfer, subnet, full VLC are all hashed, with every
+    /// variable-length field length-prefixed); the pre-V2 literal was
+    /// `691c8dd6...0dd6d` which bound only (parents, logical_time,
+    /// creator, timestamp) and let payload substitution pass `verify_id()`.
     #[test]
     fn test_genesis_event_id_is_canonical_constant() {
         const EXPECTED: &str =
-            "77dd9101b09d9c5f89c2b55fe17a77a40ea85ef76151d337d7ba8e8c19ca649b";
+            "0002eeca18388ffec22fa91120dedad33b2bc4ebcad18aa0fcb049e07aabf4a2";
         assert_eq!(Event::genesis_event_id(), EXPECTED);
 
         // Mirror setu-validator/src/main.rs genesis construction.

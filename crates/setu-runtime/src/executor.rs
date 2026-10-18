@@ -1084,16 +1084,44 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 ))?;
         }
 
-        // 2b. Mutation pass: all checks passed, apply infallibly.
+        // 2b. Mutation pass. Validation above removes every known failure
+        // mode, but a `StateStore` write can still fail. There is no
+        // transaction API, so snapshot the affected objects and roll back
+        // on any error: a failed merge must never leave sources deleted
+        // without the merged target update.
+        let target_backup = target.clone();
+        let mut source_backups: Vec<(ObjectId, Object<CoinData>)> =
+            Vec::with_capacity(source_coin_ids.len());
         for &source_id in source_coin_ids {
             let source = self.state.get_object(&source_id)?
                 .ok_or(RuntimeError::ObjectNotFound(source_id))?;
+            source_backups.push((source_id, source));
+        }
+
+        let mut mutation_error: Option<RuntimeError> = None;
+        for &source_id in source_coin_ids {
+            let source = match self.state.get_object(&source_id) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    mutation_error = Some(RuntimeError::ObjectNotFound(source_id));
+                    break;
+                }
+                Err(e) => {
+                    mutation_error = Some(e);
+                    break;
+                }
+            };
 
             let source_old_state = source.to_coin_state_bytes();
-            target.data.balance.deposit(source.data.balance)
-                .map_err(|e| RuntimeError::InvalidTransaction(e))?;
-            
-            self.state.delete_object(&source_id)?;
+            if let Err(e) = target.data.balance.deposit(source.data.balance) {
+                mutation_error = Some(RuntimeError::InvalidTransaction(e));
+                break;
+            }
+
+            if let Err(e) = self.state.delete_object(&source_id) {
+                mutation_error = Some(e);
+                break;
+            }
             deleted_objects.push(source_id);
             state_changes.push(StateChange {
                 change_type: StateChangeType::Delete,
@@ -1102,18 +1130,42 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 new_state: None,
             });
         }
-        
+
         // 3. Update target coin
-        target.increment_version();
-        let target_new_state = target.to_coin_state_bytes();
-        self.state.set_object(target_coin_id, target)?;
-        
-        state_changes.insert(0, StateChange {
-            change_type: StateChangeType::Update,
-            object_id: target_coin_id,
-            old_state: Some(target_old_state),
-            new_state: Some(target_new_state),
-        });
+        if mutation_error.is_none() {
+            target.increment_version();
+            let target_new_state = target.to_coin_state_bytes();
+            state_changes.insert(0, StateChange {
+                change_type: StateChangeType::Update,
+                object_id: target_coin_id,
+                old_state: Some(target_old_state),
+                new_state: Some(target_new_state),
+            });
+            if let Err(e) = self.state.set_object(target_coin_id, target) {
+                mutation_error = Some(e);
+            }
+        }
+
+        if let Some(e) = mutation_error {
+            // Best-effort rollback: restore every snapshot taken above.
+            for (id, obj) in source_backups {
+                if let Err(restore_err) = self.state.set_object(id, obj) {
+                    tracing::error!(
+                        object_id = %id,
+                        error = %restore_err,
+                        "merge rollback failed to restore source coin"
+                    );
+                }
+            }
+            if let Err(restore_err) = self.state.set_object(target_coin_id, target_backup) {
+                tracing::error!(
+                    object_id = %target_coin_id,
+                    error = %restore_err,
+                    "merge rollback failed to restore target coin"
+                );
+            }
+            return Err(e);
+        }
         
         Ok(ExecutionOutput {
             success: true,
@@ -1191,14 +1243,18 @@ impl<S: StateStore> RuntimeExecutor<S> {
         
         let is_exact_split = source.data.balance.value() == total_split;
         
-        // 2. Handle source coin FIRST (consume before creating new coins)
-        // This ensures atomicity: if the process crashes after this step,
-        // the source coin is already consumed and there's no inflation.
-        // Step 3 (creating new coins) becomes a recovery operation.
+        // 2. Handle source coin FIRST (consume before creating new coins).
+        // Creating outputs can still fail after the source was consumed
+        // (no transaction API), so snapshot the source and roll back the
+        // whole operation if any later write fails.
+        let source_backup = source.clone();
         let coin_type = source.data.coin_type.clone();
         if is_exact_split {
             // Exact split: delete source coin (prevent 0-balance zombie)
-            self.state.delete_object(&source_coin_id)?;
+            if let Err(e) = self.state.delete_object(&source_coin_id) {
+                let _ = self.state.set_object(source_coin_id, source_backup);
+                return Err(e);
+            }
             deleted_objects.push(source_coin_id);
             state_changes.insert(0, StateChange {
                 change_type: StateChangeType::Delete,
@@ -1214,7 +1270,10 @@ impl<S: StateStore> RuntimeExecutor<S> {
             }
             source.increment_version();
             let source_new_state = source.to_coin_state_bytes();
-            self.state.set_object(source_coin_id, source)?;
+            if let Err(e) = self.state.set_object(source_coin_id, source.clone()) {
+                let _ = self.state.set_object(source_coin_id, source_backup);
+                return Err(e);
+            }
             state_changes.insert(0, StateChange {
                 change_type: StateChangeType::Update,
                 object_id: source_coin_id,
@@ -1235,7 +1294,21 @@ impl<S: StateStore> RuntimeExecutor<S> {
             );
             let new_coin_state = new_coin.to_coin_state_bytes();
             
-            self.state.set_object(new_coin_id, new_coin)?;
+            if let Err(e) = self.state.set_object(new_coin_id, new_coin) {
+                // Roll back: remove outputs created so far and restore the
+                // source coin to its pre-split state.
+                for created in &created_objects {
+                    let _ = self.state.delete_object(created);
+                }
+                if let Err(restore_err) = self.state.set_object(source_coin_id, source_backup) {
+                    tracing::error!(
+                        object_id = %source_coin_id,
+                        error = %restore_err,
+                        "split rollback failed to restore source coin"
+                    );
+                }
+                return Err(e);
+            }
             created_objects.push(new_coin_id);
             
             state_changes.push(StateChange {

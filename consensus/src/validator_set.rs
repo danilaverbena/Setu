@@ -89,8 +89,10 @@ impl ValidatorSet {
     /// Returns `true` if the validator was added, `false` if verification
     /// failed (a warning is logged). Callers MUST check the return value:
     /// a rejected insert must not be reported as success.
-    pub fn add_validator(&mut self, mut info: ValidatorInfo) -> bool {
-        // Verify the validator's signature (audit #45 / unauthenticated membership)
+    pub fn add_validator(&mut self, info: ValidatorInfo) -> bool {
+        // Verify the validator's signature (audit #45 / unauthenticated
+        // membership). `verify()` fails closed, so an empty signature is
+        // rejected here rather than silently treated as trusted.
         if let Err(e) = info.verify() {
             warn!(
                 validator_id = %info.node.id,
@@ -99,6 +101,22 @@ impl ValidatorSet {
             return false;
         }
 
+        self.insert_validator(info);
+        true
+    }
+
+    /// Add a validator WITHOUT signature verification.
+    ///
+    /// Reserved for trusted sources only: genesis configuration and the
+    /// node's own local record (which has no remote peer to attest it yet).
+    /// Never call this with network-supplied data — untrusted membership
+    /// updates must go through `add_validator`, which fails closed.
+    pub fn add_trusted_validator(&mut self, info: ValidatorInfo) -> bool {
+        self.insert_validator(info);
+        true
+    }
+
+    fn insert_validator(&mut self, mut info: ValidatorInfo) -> bool {
         let is_first = self.validators.is_empty();
 
         // First validator becomes the initial leader

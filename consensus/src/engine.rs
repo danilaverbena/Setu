@@ -593,7 +593,7 @@ impl ConsensusEngine {
 
     /// Add a validator to the consensus set, updating both ValidatorSet and
     /// ConsensusManager.validator_count atomically.
-    pub async fn add_consensus_validator(&self, info: setu_types::ValidatorInfo) {
+    pub async fn add_consensus_validator(&self, info: setu_types::ValidatorInfo) -> bool {
         let (added, count) = {
             let mut vs = self.validator_set.write().await;
             // add_validator may reject unauthenticated membership changes (#45):
@@ -618,6 +618,28 @@ impl ConsensusEngine {
                 "Validator NOT added to consensus (rejected)"
             );
         }
+        added
+    }
+
+    /// Add a statically configured validator WITHOUT signature checks.
+    ///
+    /// Trusted path for genesis / operator config peers. Never call with
+    /// network-supplied membership data.
+    pub async fn add_trusted_consensus_validator(&self, info: setu_types::ValidatorInfo) {
+        let count = {
+            let mut vs = self.validator_set.write().await;
+            vs.add_trusted_validator(info.clone());
+            vs.count()
+        };
+        {
+            let mut cm = self.consensus_manager.write().await;
+            cm.update_validator_count(count);
+        }
+        info!(
+            validator_id = %info.node.id,
+            total_count = count,
+            "Trusted validator added to consensus"
+        );
     }
 
     /// Get a reference to the ValidatorSet (for external queries).

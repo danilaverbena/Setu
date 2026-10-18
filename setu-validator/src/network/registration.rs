@@ -48,6 +48,29 @@ fn validate_public_subnet_name(raw: &str) -> Result<String, &'static str> {
     Ok(raw.to_string())
 }
 
+/// Verify an Ed25519 consensus-key proof over the validator ID.
+fn verify_consensus_key_proof(
+    validator_id: &str,
+    consensus_public_key: &[u8],
+    consensus_signature: &[u8],
+) -> Result<(), &'static str> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    if consensus_public_key.len() != 32 {
+        return Err("consensus public key must be 32 bytes (Ed25519)");
+    }
+    if consensus_signature.len() != 64 {
+        return Err("consensus signature must be 64 bytes (Ed25519)");
+    }
+    let pk_bytes: &[u8; 32] = consensus_public_key
+        .try_into()
+        .map_err(|_| "invalid consensus public key length")?;
+    let pk = VerifyingKey::from_bytes(pk_bytes).map_err(|_| "invalid consensus public key")?;
+    let sig = Signature::from_slice(consensus_signature).map_err(|_| "invalid signature format")?;
+    pk.verify(validator_id.as_bytes(), &sig)
+        .map_err(|_| "consensus key proof does not verify")
+}
+
 #[async_trait::async_trait]
 impl RegistrationHandler for ValidatorRegistrationHandler {
     async fn register_solver(&self, request: RegisterSolverRequest) -> RegisterSolverResponse {
@@ -191,6 +214,10 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         // (mutable post-sign via with_commission_rate), so build the check
         // registration WITHOUT applying the requested rate first.
         {
+            // The Ed25519 consensus key MUST be bound into the signed
+            // identity: otherwise a relay can keep a victim's valid
+            // secp256k1 registration signature while substituting its own
+            // vote-signing key.
             let auth_check = ValidatorRegistration::new(
                 request.validator_id.clone(),
                 request.address.clone(),
@@ -199,7 +226,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 request.public_key.clone(),
                 request.signature.clone(),
                 request.stake_amount,
-            );
+            )
+            .with_consensus_key(request.consensus_public_key.clone());
             if !auth_check.verify_signature() {
                 warn!(
                     validator_id = %request.validator_id,
@@ -208,6 +236,24 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 return RegisterValidatorResponse {
                     success: false,
                     message: "Invalid registration signature: must prove ownership of the claimed public key".to_string(),
+                };
+            }
+
+            // Prove possession of the consensus key: the record we insert
+            // into the consensus set signs votes with it, so admission must
+            // verify a signature over the node ID made by that key.
+            if let Err(reason) = verify_consensus_key_proof(
+                &request.validator_id,
+                &request.consensus_public_key,
+                &request.consensus_signature,
+            ) {
+                warn!(
+                    validator_id = %request.validator_id,
+                    "Rejecting validator registration: {}", reason
+                );
+                return RegisterValidatorResponse {
+                    success: false,
+                    message: format!("Invalid consensus key proof: {reason}"),
                 };
             }
         }
@@ -231,6 +277,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             request.signature.clone(),
             request.stake_amount,
         )
+        .with_consensus_key(request.consensus_public_key.clone())
         .with_commission_rate(request.commission_rate);
 
         let mut event = Event::validator_register(
@@ -278,12 +325,27 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         self.service.add_validator(validator_info);
 
         if let Some(cv) = self.service.consensus_validator() {
-            let peer_node_info = setu_types::NodeInfo::new_validator(
+            let mut peer_node_info = setu_types::NodeInfo::new_validator(
                 request.validator_id.clone(),
                 request.address.clone(),
                 request.port,
             );
-            cv.add_peer_validator(peer_node_info).await;
+            // Carry the authenticated vote-signing key into the consensus
+            // record; without it votes from this validator are unverifiable
+            // (or, worse, the member is unbound to the authenticated key).
+            peer_node_info.public_key = request.consensus_public_key.clone();
+            let peer_info = setu_types::ValidatorInfo::new(peer_node_info, false)
+                .with_signature(request.consensus_signature.clone());
+            if !cv.add_peer_validator(peer_info).await {
+                warn!(
+                    validator_id = %request.validator_id,
+                    "Consensus layer rejected authenticated validator admission"
+                );
+                return RegisterValidatorResponse {
+                    success: false,
+                    message: "Consensus layer rejected validator admission".to_string(),
+                };
+            }
             info!(
                 "Consensus layer updated: validator {} added",
                 request.validator_id

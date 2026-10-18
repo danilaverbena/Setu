@@ -2345,7 +2345,19 @@ mod tests {
             vec![],
             1000,
         );
+        // Consensus (Ed25519) key + proof over the node ID; bound into the
+        // secp256k1 registration signature like a real client does.
+        let ed_signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let consensus_public_key = ed_signing_key.verifying_key().to_bytes().to_vec();
+        reg.consensus_public_key = consensus_public_key.clone();
         reg.sign(&[42u8; 32]).expect("sign test request");
+        let consensus_signature = {
+            use ed25519_dalek::Signer;
+            ed_signing_key
+                .sign(validator_id.as_bytes())
+                .to_bytes()
+                .to_vec()
+        };
         setu_rpc::RegisterValidatorRequest {
             validator_id: validator_id.to_string(),
             address: "127.0.0.1".to_string(),
@@ -2355,6 +2367,8 @@ mod tests {
             signature: reg.signature,
             stake_amount: 1000,
             commission_rate: 10,
+            consensus_public_key,
+            consensus_signature,
         }
     }
 

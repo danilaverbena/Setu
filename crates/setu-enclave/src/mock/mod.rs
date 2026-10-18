@@ -635,7 +635,7 @@ impl MockEnclave {
         &self,
         input: &StfInput,
         _local_runtime: Option<RuntimeExecutor<InMemoryStateStore>>,
-    ) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>)> {
+    ) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>, [u8; 32])> {
         let start = std::time::Instant::now();
         let mut diff = StateDiff::new();
         let mut processed = Vec::new();
@@ -675,10 +675,18 @@ impl MockEnclave {
             }
         }
 
+        // Compute the post-state root while the execution write guard is
+        // still held. Releasing it first lets a concurrent legacy
+        // `execute_stf` mutate `self.runtime` in between, returning this
+        // call's diff paired with the OTHER call's state root.
+        let raw_data = Self::state_store_root_data(runtime_guard.state())?;
+        let post_state_root = Self::compute_state_root(&raw_data, &diff);
+        drop(runtime_guard);
+
         // Increment execution counter
         *self.execution_count.write().await += 1;
 
-        Ok((diff, processed, failed))
+        Ok((diff, processed, failed, post_state_root))
     }
 
     /// Execute events with an isolated local runtime (solver-tee3 mode)
@@ -1697,19 +1705,48 @@ impl MockEnclave {
         since = "0.3.0",
         note = "Mock state root uses simple hash, not SMT. Replace with real SMT for accurate testing."
     )]
-    fn compute_state_root(state: &HashMap<String, Vec<u8>>) -> [u8; 32] {
+    /// Attested post-state root.
+    ///
+    /// Covers the executed store AND every change reported in `diff`:
+    /// isolated-path Power/Flux writes (and any other diff-only mutation)
+    /// never land in the runtime store, so hashing the store alone attested
+    /// a state different from the diff returned to the caller.
+    fn compute_state_root(state: &HashMap<String, Vec<u8>>, diff: &StateDiff) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"SETU_MOCK_STATE:");
 
-        // Sort keys for determinism
+        // Sort keys for determinism; length-prefix every field so
+        // (key, value) boundaries are unambiguous.
         let mut keys: Vec<_> = state.keys().collect();
         keys.sort();
 
         for key in keys {
             if let Some(value) = state.get(key) {
+                hasher.update(&(key.len() as u64).to_le_bytes());
                 hasher.update(key.as_bytes());
+                hasher.update(&(value.len() as u64).to_le_bytes());
                 hasher.update(value);
             }
+        }
+
+        // Writes preserve execution order (last-write-wins is meaningful).
+        hasher.update(b"|DIFF_WRITES:");
+        hasher.update(&(diff.writes.len() as u64).to_le_bytes());
+        for w in &diff.writes {
+            hasher.update(&(w.key.len() as u64).to_le_bytes());
+            hasher.update(w.key.as_bytes());
+            hasher.update(&(w.new_value.len() as u64).to_le_bytes());
+            hasher.update(&w.new_value);
+        }
+
+        // Deletes sorted for determinism (set semantics).
+        let mut deletes: Vec<&String> = diff.deletes.iter().collect();
+        deletes.sort();
+        hasher.update(b"|DIFF_DELETES:");
+        hasher.update(&(deletes.len() as u64).to_le_bytes());
+        for d in deletes {
+            hasher.update(&(d.len() as u64).to_le_bytes());
+            hasher.update(d.as_bytes());
         }
 
         *hasher.finalize().as_bytes()
@@ -1825,7 +1862,7 @@ impl EnclaveRuntime for MockEnclave {
                 self.simulate_execution_isolated(&input, local_runtime)
                     .await?;
             let raw_data = Self::object_store_root_data(runtime.state())?;
-            let post_state_root = Self::compute_state_root(&raw_data);
+            let post_state_root = Self::compute_state_root(&raw_data, &diff);
             (diff, events_processed, events_failed, post_state_root)
         } else {
             // Legacy mode: use shared self.runtime (only for backward compatibility).
@@ -1833,15 +1870,11 @@ impl EnclaveRuntime for MockEnclave {
             // the state_diff surfaced in StfOutput; dropping them (as an
             // earlier revision did) reports empty writes/events for every
             // legacy execution.
-            let (diff, events_processed, events_failed) =
+            let (diff, events_processed, events_failed, post_state_root) =
                 self.simulate_execution(&input, None).await?;
-            // self.runtime contains the post-execution state. Read it under
-            // the existing guard directly (no clone + RuntimeExecutor rebuild).
-            let post_state_root = {
-                let guard = self.runtime.read().await;
-                let raw_data = Self::state_store_root_data(guard.state())?;
-                Self::compute_state_root(&raw_data)
-            };
+            // NOTE: the root is computed inside `simulate_execution` while
+            // its execution write guard is held — do NOT re-read
+            // `self.runtime` here.
             (diff, events_processed, events_failed, post_state_root)
         };
 
@@ -2006,6 +2039,29 @@ mod tests {
             setu_move_vm::move_core_types::account_address::AccountAddress::new(addr),
             setu_move_vm::move_core_types::identifier::Identifier::new(name).unwrap(),
         )
+    }
+
+    /// Two executions with identical runtime stores but different
+    /// diff-only writes (Power/Flux) must attest different roots: the root
+    /// has to cover everything the returned diff reports.
+    #[test]
+    fn test_post_state_root_binds_diff_only_writes() {
+        use crate::stf::WriteSetEntry;
+
+        let mut store = HashMap::new();
+        store.insert("robj:a".to_string(), vec![1u8, 2, 3]);
+
+        let mut diff_a = StateDiff::new();
+        diff_a.add_write(WriteSetEntry::new("power:alice".to_string(), vec![9]));
+        let mut diff_b = StateDiff::new();
+        diff_b.add_write(WriteSetEntry::new("power:alice".to_string(), vec![8]));
+
+        let root_a = MockEnclave::compute_state_root(&store, &diff_a);
+        let root_b = MockEnclave::compute_state_root(&store, &diff_b);
+        assert_ne!(
+            root_a, root_b,
+            "diff-only writes must be committed to the attested root"
+        );
     }
 
     fn create_test_event(id: &str) -> Event {

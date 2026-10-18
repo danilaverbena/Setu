@@ -36,6 +36,14 @@ pub struct ValidatorRegistration {
     pub public_key: Vec<u8>,
     /// Registration signature proving ownership of the account
     pub signature: Vec<u8>,
+    /// Ed25519 consensus public key (32 bytes) used to verify votes.
+    ///
+    /// Separate from `public_key` (secp256k1 ownership key): the secp key
+    /// proves who is registering, this key is what the validator signs
+    /// votes with. Bound into the signed identity so a relay cannot swap
+    /// it for its own.
+    #[serde(default)]
+    pub consensus_public_key: Vec<u8>,
     
     // ========== Economic Parameters ==========
     /// Stake amount in Flux (minimum required for validator)
@@ -62,9 +70,16 @@ impl ValidatorRegistration {
             account_address: account_address.into(),
             public_key,
             signature,
+            consensus_public_key: Vec::new(),
             stake_amount,
             commission_rate: 10, // Default 10%
         }
+    }
+
+    /// Bind the Ed25519 consensus key to this registration.
+    pub fn with_consensus_key(mut self, key: Vec<u8>) -> Self {
+        self.consensus_public_key = key;
+        self
     }
     
     pub fn with_commission_rate(mut self, rate: u8) -> Self {
@@ -117,6 +132,10 @@ impl ValidatorRegistration {
         extend_len_prefixed(&mut msg, self.account_address.as_bytes());
         msg.extend_from_slice(&self.stake_amount.to_le_bytes());
         extend_len_prefixed(&mut msg, self.public_key.as_slice());
+        // Presence tag + length-prefixed key: an empty consensus key must
+        // not hash the same as a missing field.
+        msg.push(if self.consensus_public_key.is_empty() { 0 } else { 1 });
+        extend_len_prefixed(&mut msg, self.consensus_public_key.as_slice());
         msg
     }
 
